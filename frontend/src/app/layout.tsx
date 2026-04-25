@@ -37,8 +37,9 @@ export default function RootLayout({
     <html
       lang="id"
       className={`${outfit.variable} ${jetbrainsMono.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
-      <body className="min-h-full flex flex-col">
+      <body className="min-h-full flex flex-col" suppressHydrationWarning>
         <Providers>
           <Navbar />
           <main className="flex-grow">{children}</main>

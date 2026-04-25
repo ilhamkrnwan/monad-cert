@@ -1,13 +1,17 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import { useState, useEffect, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { EDUTRUST_ABI, EDUTRUST_ADDRESS } from '@/config/contracts';
 import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
-import { ShieldAlert, Plus, Send, Loader2, CheckCircle2, XCircle, History, Trash2 } from 'lucide-react';
+import {
+  ShieldAlert, Plus, Send, Loader2, CheckCircle2, XCircle,
+  History, Trash2, Upload, FileText, X, ImageIcon
+} from 'lucide-react';
+import { RegistrationForm } from '@/components/dashboard/RegistrationForm';
 
 interface CertificateRow {
   id: string;
@@ -24,6 +28,8 @@ interface RecipientInput {
   wallet: string;
   title: string;
   description: string;
+  file: File | null;           // Physical certificate file (PDF/image)
+  filePreview: string | null;  // Object URL for preview
 }
 
 const fadeUp = {
@@ -31,14 +37,101 @@ const fadeUp = {
   show: { opacity: 1, y: 0, transition: { duration: 0.5 } },
 };
 
+const ACCEPTED_FILE_TYPES = '.pdf,.jpg,.jpeg,.png,.webp';
+const MAX_FILE_SIZE_MB = 10;
+
+function FileDropZone({
+  value,
+  preview,
+  onChange,
+  onClear,
+}: {
+  value: File | null;
+  preview: string | null;
+  onChange: (file: File) => void;
+  onClear: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const handleFile = (file: File) => {
+    if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+      alert(`Ukuran file maksimal ${MAX_FILE_SIZE_MB}MB`);
+      return;
+    }
+    onChange(file);
+  };
+
+  const isImage = value?.type.startsWith('image/');
+
+  return (
+    <div className="md:col-span-2">
+      {!value ? (
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            const f = e.dataTransfer.files[0];
+            if (f) handleFile(f);
+          }}
+          onClick={() => inputRef.current?.click()}
+          className={`relative flex flex-col items-center justify-center gap-2 h-28 rounded-xl border-2 border-dashed cursor-pointer transition-all ${
+            dragging
+              ? 'border-[var(--primary)] bg-[var(--primary)]/5'
+              : 'border-border hover:border-[var(--primary)]/50 hover:bg-[var(--secondary)]/50'
+          }`}
+        >
+          <Upload className="h-6 w-6 text-muted-foreground" />
+          <div className="text-center">
+            <p className="text-sm font-medium text-foreground">Upload File Sertifikat</p>
+            <p className="text-xs text-muted-foreground">PDF, JPG, PNG — Maks. {MAX_FILE_SIZE_MB}MB</p>
+          </div>
+          <input
+            ref={inputRef}
+            type="file"
+            accept={ACCEPTED_FILE_TYPES}
+            className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
+          />
+        </div>
+      ) : (
+        <div className="relative flex items-center gap-3 p-3 rounded-xl border border-[var(--primary)]/20 bg-[var(--primary)]/5">
+          {isImage && preview ? (
+            <img src={preview} alt="preview" className="h-14 w-14 rounded-lg object-cover flex-shrink-0" />
+          ) : (
+            <div className="h-14 w-14 rounded-lg bg-red-100 dark:bg-red-900/20 flex items-center justify-center flex-shrink-0">
+              <FileText className="h-6 w-6 text-red-500" />
+            </div>
+          )}
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-foreground truncate">{value.name}</p>
+            <p className="text-xs text-muted-foreground">{(value.size / 1024).toFixed(0)} KB · {value.type.split('/')[1]?.toUpperCase()}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClear}
+            className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-muted-foreground hover:text-red-500 transition-colors flex-shrink-0"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const { address, isConnected } = useAccount();
   const [tab, setTab] = useState<'issue' | 'history'>('issue');
   const [recipients, setRecipients] = useState<RecipientInput[]>([
-    { name: '', wallet: '', title: '', description: '' },
+    { name: '', wallet: '', title: '', description: '', file: null, filePreview: null },
   ]);
   const [certificates, setCertificates] = useState<CertificateRow[]>([]);
   const [loadingCerts, setLoadingCerts] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string>('');
+  const [mintError, setMintError] = useState<string | null>(null);
 
   const { data: isApproved, isLoading: checkingApproval } = useReadContract({
     abi: EDUTRUST_ABI,
@@ -52,10 +145,15 @@ export default function DashboardPage() {
   const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({ hash: txHash });
 
   useEffect(() => {
-    if (address && isApproved) {
-      fetchCertificates();
-    }
+    if (address && isApproved) fetchCertificates();
   }, [address, isApproved]);
+
+  useEffect(() => {
+    if (isConfirmed) {
+      setUploadProgress('');
+      setRecipients([{ name: '', wallet: '', title: '', description: '', file: null, filePreview: null }]);
+    }
+  }, [isConfirmed]);
 
   const fetchCertificates = async () => {
     if (!address) return;
@@ -70,16 +168,34 @@ export default function DashboardPage() {
   };
 
   const addRecipient = () => {
-    setRecipients([...recipients, { name: '', wallet: '', title: '', description: '' }]);
+    setRecipients([...recipients, { name: '', wallet: '', title: '', description: '', file: null, filePreview: null }]);
   };
 
   const removeRecipient = (i: number) => {
+    const r = recipients[i];
+    if (r.filePreview) URL.revokeObjectURL(r.filePreview);
     setRecipients(recipients.filter((_, idx) => idx !== i));
   };
 
-  const updateRecipient = (i: number, field: keyof RecipientInput, value: string) => {
+  const updateRecipient = (i: number, field: keyof Omit<RecipientInput, 'file' | 'filePreview'>, value: string) => {
     const updated = [...recipients];
     updated[i][field] = value;
+    setRecipients(updated);
+  };
+
+  const setFile = (i: number, file: File) => {
+    const updated = [...recipients];
+    if (updated[i].filePreview) URL.revokeObjectURL(updated[i].filePreview!);
+    updated[i].file = file;
+    updated[i].filePreview = URL.createObjectURL(file);
+    setRecipients(updated);
+  };
+
+  const clearFile = (i: number) => {
+    const updated = [...recipients];
+    if (updated[i].filePreview) URL.revokeObjectURL(updated[i].filePreview!);
+    updated[i].file = null;
+    updated[i].filePreview = null;
     setRecipients(updated);
   };
 
@@ -88,11 +204,34 @@ export default function DashboardPage() {
     const validRecipients = recipients.filter((r) => r.name && r.wallet && r.title);
     if (validRecipients.length === 0) return;
 
+    setMintError(null);
     const metadataUrls: string[] = [];
     const wallets: `0x${string}`[] = [];
 
-    for (const r of validRecipients) {
-      const metadata = {
+    for (let idx = 0; idx < validRecipients.length; idx++) {
+      const r = validRecipients[idx];
+      const ts = Date.now();
+      const slug = Math.random().toString(36).substring(7);
+
+      // 1. Upload physical certificate file (PDF/image) if provided
+      let documentUrl: string | null = null;
+      if (r.file) {
+        const ext = r.file.name.split('.').pop();
+        const docPath = `documents/${address.toLowerCase()}/${ts}_${slug}.${ext}`;
+        setUploadProgress(`[${idx + 1}/${validRecipients.length}] Mengupload file sertifikat...`);
+
+        const { data: docData, error: docErr } = await supabase.storage
+          .from('certificates')
+          .upload(docPath, r.file, { upsert: false, contentType: r.file.type });
+
+        if (!docErr && docData) {
+          const { data: pubUrl } = supabase.storage.from('certificates').getPublicUrl(docData.path);
+          documentUrl = pubUrl.publicUrl;
+        }
+      }
+
+      // 2. Build ERC-721 metadata JSON
+      const metadata: Record<string, unknown> = {
         name: r.title,
         description: r.description || `Certificate issued to ${r.name}`,
         attributes: [
@@ -101,40 +240,58 @@ export default function DashboardPage() {
           { trait_type: 'Issued Date', value: new Date().toISOString().split('T')[0] },
         ],
       };
+      if (documentUrl) {
+        // Store document URL in metadata — image field for NFT marketplaces
+        metadata.image = documentUrl;
+        metadata.document_url = documentUrl;
+      }
 
-      const blob = new Blob([JSON.stringify(metadata)], { type: 'application/json' });
-      const fileName = `cert_${Date.now()}_${Math.random().toString(36).substring(7)}.json`;
-      const { data: uploadData, error: uploadError } = await supabase.storage
+      // 3. Upload metadata JSON
+      setUploadProgress(`[${idx + 1}/${validRecipients.length}] Menyimpan metadata...`);
+      const metaBlob = new Blob([JSON.stringify(metadata, null, 2)], { type: 'application/json' });
+      const metaPath = `metadata/${address.toLowerCase()}/${ts}_${slug}.json`;
+
+      const { data: metaData, error: metaErr } = await supabase.storage
         .from('certificates')
-        .upload(fileName, blob);
+        .upload(metaPath, metaBlob, { upsert: false, contentType: 'application/json' });
 
-      if (uploadError) {
+      if (metaErr || !metaData) {
+        // Fallback: base64 inline data URI
         const url = `data:application/json;base64,${btoa(JSON.stringify(metadata))}`;
         metadataUrls.push(url);
       } else {
-        const { data: publicUrl } = supabase.storage.from('certificates').getPublicUrl(uploadData.path);
-        metadataUrls.push(publicUrl.publicUrl);
+        const { data: pubUrl } = supabase.storage.from('certificates').getPublicUrl(metaData.path);
+        metadataUrls.push(pubUrl.publicUrl);
       }
 
       wallets.push(r.wallet as `0x${string}`);
     }
 
-    if (validRecipients.length === 1) {
-      writeContract({
-        abi: EDUTRUST_ABI,
-        address: EDUTRUST_ADDRESS,
-        functionName: 'issueCertificate',
-        args: [wallets[0], metadataUrls[0]],
-      });
-    } else {
-      writeContract({
-        abi: EDUTRUST_ABI,
-        address: EDUTRUST_ADDRESS,
-        functionName: 'batchIssueCertificate',
-        args: [wallets, metadataUrls],
-      });
+    setUploadProgress('Mengirim transaksi ke blockchain Monad...');
+
+    try {
+      if (validRecipients.length === 1) {
+        writeContract({
+          abi: EDUTRUST_ABI,
+          address: EDUTRUST_ADDRESS,
+          functionName: 'issueCertificate',
+          args: [wallets[0], metadataUrls[0]],
+        });
+      } else {
+        writeContract({
+          abi: EDUTRUST_ABI,
+          address: EDUTRUST_ADDRESS,
+          functionName: 'batchIssueCertificate',
+          args: [wallets, metadataUrls],
+        });
+      }
+    } catch {
+      setMintError('Gagal mengirim transaksi. Pastikan wallet terhubung dan memiliki cukup MON.');
+      setUploadProgress('');
     }
   };
+
+  // ── Guards ────────────────────────────────────────────────
 
   if (!isConnected) {
     return (
@@ -163,25 +320,19 @@ export default function DashboardPage() {
 
   if (!isApproved) {
     return (
-      <div className="min-h-screen flex items-center justify-center px-5">
-        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="text-center max-w-md">
-          <div className="w-16 h-16 rounded-2xl bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center mx-auto mb-6">
-            <ShieldAlert className="h-8 w-8 text-amber-600 dark:text-amber-400" />
-          </div>
-          <h2 className="text-2xl font-bold mb-3">Institusi Belum Terverifikasi</h2>
-          <p className="text-muted-foreground mb-4">
-            Wallet <code className="text-xs font-mono bg-[var(--muted)] px-2 py-1 rounded">{address}</code> belum terdaftar sebagai institusi yang disetujui.
-          </p>
-          <p className="text-sm text-muted-foreground">Hubungi admin MonadCert untuk mendaftarkan institusi Anda.</p>
-        </motion.div>
+      <div className="min-h-screen pt-24 pb-16 px-5 sm:px-8 relative overflow-hidden">
+        <div className="absolute top-[-10%] right-[-10%] w-[400px] h-[400px] rounded-full bg-gradient-to-br from-[#c4b5fd]/20 to-[#a78bfa]/10 blur-[100px] pointer-events-none animate-float" />
+        <div className="absolute bottom-[-10%] left-[-10%] w-[300px] h-[300px] rounded-full bg-gradient-to-br from-[#67e8f9]/15 to-[#22d3ee]/5 blur-[100px] pointer-events-none animate-float-delayed" />
+        <RegistrationForm walletAddress={address!} />
       </div>
     );
   }
 
+  // ── Main Dashboard ────────────────────────────────────────
+
   return (
     <div className="min-h-screen pt-24 pb-16 px-5 sm:px-8">
       <div className="max-w-5xl mx-auto">
-        {/* Header */}
         <motion.div initial="hidden" animate="show" variants={fadeUp} className="mb-8">
           <h1 className="text-3xl font-bold text-foreground mb-2">Portal Institusi</h1>
           <p className="text-muted-foreground">Terbitkan sertifikat Soulbound Token ke penerima.</p>
@@ -189,28 +340,22 @@ export default function DashboardPage() {
 
         {/* Tabs */}
         <div className="flex gap-2 mb-8">
-          <button
-            onClick={() => setTab('issue')}
-            className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
-              tab === 'issue'
-                ? 'bg-[var(--primary)] text-white shadow-lg shadow-[var(--primary)]/20'
-                : 'bg-[var(--secondary)] text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            <Plus className="inline h-4 w-4 mr-1.5 -mt-0.5" />
-            Terbitkan Sertifikat
-          </button>
-          <button
-            onClick={() => setTab('history')}
-            className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
-              tab === 'history'
-                ? 'bg-[var(--primary)] text-white shadow-lg shadow-[var(--primary)]/20'
-                : 'bg-[var(--secondary)] text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            <History className="inline h-4 w-4 mr-1.5 -mt-0.5" />
-            Riwayat
-          </button>
+          {([
+            { key: 'issue', icon: Plus, label: 'Terbitkan Sertifikat' },
+            { key: 'history', icon: History, label: 'Riwayat' },
+          ] as const).map(({ key, icon: Icon, label }) => (
+            <button
+              key={key}
+              onClick={() => setTab(key)}
+              className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
+                tab === key
+                  ? 'bg-[var(--primary)] text-white shadow-lg shadow-[var(--primary)]/20'
+                  : 'bg-[var(--secondary)] text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <Icon className="inline h-4 w-4 mr-1.5 -mt-0.5" />{label}
+            </button>
+          ))}
         </div>
 
         {/* Issue Tab */}
@@ -218,32 +363,47 @@ export default function DashboardPage() {
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-4">
             {recipients.map((r, i) => (
               <div key={i} className="p-6 rounded-2xl border border-border bg-white/60 dark:bg-[#1a1932]/40 backdrop-blur-sm">
-                <div className="flex items-center justify-between mb-4">
-                  <span className="text-xs font-mono font-semibold text-[var(--primary)]">Penerima #{i + 1}</span>
+                <div className="flex items-center justify-between mb-5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono font-bold text-[var(--primary)] bg-[var(--secondary)] px-2.5 py-1 rounded-full">
+                      Penerima #{i + 1}
+                    </span>
+                    {r.file && (
+                      <span className="text-xs flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                        {r.file.type.startsWith('image/') ? <ImageIcon className="h-3 w-3" /> : <FileText className="h-3 w-3" />}
+                        {r.file.name.length > 20 ? r.file.name.slice(0, 20) + '...' : r.file.name}
+                      </span>
+                    )}
+                  </div>
                   {recipients.length > 1 && (
-                    <button onClick={() => removeRecipient(i)} className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-muted-foreground hover:text-red-500 transition-colors">
+                    <button
+                      onClick={() => removeRecipient(i)}
+                      className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-muted-foreground hover:text-red-500 transition-colors"
+                    >
                       <Trash2 className="h-4 w-4" />
                     </button>
                   )}
                 </div>
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Text inputs */}
                   <input
                     type="text"
-                    placeholder="Nama Lengkap Penerima"
+                    placeholder="Nama Lengkap Penerima *"
                     value={r.name}
                     onChange={(e) => updateRecipient(i, 'name', e.target.value)}
                     className="w-full h-11 px-4 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/30 focus:border-[var(--primary)]"
                   />
                   <input
                     type="text"
-                    placeholder="Wallet Address (0x...)"
+                    placeholder="Wallet Address (0x...) *"
                     value={r.wallet}
                     onChange={(e) => updateRecipient(i, 'wallet', e.target.value)}
                     className="w-full h-11 px-4 rounded-xl border border-border bg-background text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/30 focus:border-[var(--primary)]"
                   />
                   <input
                     type="text"
-                    placeholder="Judul Sertifikat"
+                    placeholder="Judul Sertifikat *"
                     value={r.title}
                     onChange={(e) => updateRecipient(i, 'title', e.target.value)}
                     className="w-full h-11 px-4 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/30 focus:border-[var(--primary)]"
@@ -255,46 +415,56 @@ export default function DashboardPage() {
                     onChange={(e) => updateRecipient(i, 'description', e.target.value)}
                     className="w-full h-11 px-4 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/30 focus:border-[var(--primary)]"
                   />
+
+                  {/* File drop zone — full width */}
+                  <FileDropZone
+                    value={r.file}
+                    preview={r.filePreview}
+                    onChange={(f) => setFile(i, f)}
+                    onClear={() => clearFile(i)}
+                  />
                 </div>
               </div>
             ))}
 
+            {/* Actions */}
             <div className="flex flex-col sm:flex-row gap-3 pt-2">
-              <Button
-                variant="outline"
-                onClick={addRecipient}
-                className="rounded-xl border-dashed border-2"
-              >
-                <Plus className="h-4 w-4 mr-2" />
-                Tambah Penerima (Batch)
+              <Button variant="outline" onClick={addRecipient} className="rounded-xl border-dashed border-2">
+                <Plus className="h-4 w-4 mr-2" />Tambah Penerima (Batch)
               </Button>
-
               <Button
                 onClick={handleMint}
-                disabled={isMinting || isConfirming}
+                disabled={isMinting || isConfirming || !!uploadProgress}
                 className="rounded-xl bg-[var(--primary)] hover:bg-[var(--primary)]/90 text-white shadow-lg shadow-[var(--primary)]/20"
               >
-                {isMinting || isConfirming ? (
-                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" />{isConfirming ? 'Mengkonfirmasi...' : 'Mengirim Transaksi...'}</>
+                {isMinting || isConfirming || uploadProgress ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" />{uploadProgress || (isConfirming ? 'Mengkonfirmasi...' : 'Memproses...')}</>
                 ) : (
                   <><Send className="h-4 w-4 mr-2" />Terbitkan {recipients.length > 1 ? `${recipients.length} Sertifikat (Batch)` : 'Sertifikat'}</>
                 )}
               </Button>
             </div>
 
-            {isConfirmed && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-800/50 flex items-center gap-3"
-              >
-                <CheckCircle2 className="h-5 w-5 text-emerald-600 flex-shrink-0" />
-                <div>
-                  <p className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">Sertifikat Berhasil Diterbitkan!</p>
-                  <p className="text-xs text-emerald-600/80 dark:text-emerald-400/80 font-mono mt-0.5">TX: {txHash}</p>
-                </div>
-              </motion.div>
-            )}
+            {/* Status messages */}
+            <AnimatePresence mode="wait">
+              {mintError && (
+                <motion.div key="err" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+                  className="p-4 rounded-2xl border border-destructive/30 bg-destructive/5 flex items-center gap-3">
+                  <XCircle className="h-5 w-5 text-destructive flex-shrink-0" />
+                  <p className="text-sm text-destructive">{mintError}</p>
+                </motion.div>
+              )}
+              {isConfirmed && txHash && (
+                <motion.div key="ok" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+                  className="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-800/50 flex items-center gap-3">
+                  <CheckCircle2 className="h-5 w-5 text-emerald-600 flex-shrink-0" />
+                  <div>
+                    <p className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">Sertifikat Berhasil Diterbitkan!</p>
+                    <p className="text-xs text-emerald-600/80 dark:text-emerald-400/80 font-mono mt-0.5 break-all">TX: {txHash}</p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </motion.div>
         )}
 
@@ -340,7 +510,9 @@ export default function DashboardPage() {
                               ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
                               : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
                           }`}>
-                            {cert.status === 'MINTED' ? <CheckCircle2 className="h-3 w-3" /> : cert.status === 'REVOKED' ? <XCircle className="h-3 w-3" /> : <Loader2 className="h-3 w-3" />}
+                            {cert.status === 'MINTED' && <CheckCircle2 className="h-3 w-3" />}
+                            {cert.status === 'REVOKED' && <XCircle className="h-3 w-3" />}
+                            {cert.status === 'PENDING_MINT' && <Loader2 className="h-3 w-3" />}
                             {cert.status}
                           </span>
                         </td>

@@ -4,7 +4,7 @@ import { http } from 'wagmi';
 
 export const config = getDefaultConfig({
   appName: 'MonadCert',
-  projectId: '3bc9b6eeab33c7f8a7e0ed8a3ed14db3',
+  projectId: 'a2c70c7cde8ed64ca250de7616de2bcb',
   chains: [monadTestnet],
   transports: {
     [monadTestnet.id]: http('https://testnet-rpc.monad.xyz'),

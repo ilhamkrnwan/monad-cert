@@ -10,7 +10,7 @@ import { supabase } from '@/lib/supabase';
 
 const fadeUp = {
   hidden: { opacity: 0, y: 20 },
-  show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: [0.22, 1, 0.36, 1] } },
+  show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: 'easeOut' as const } },
 };
 
 function truncateAddress(addr: string) {
@@ -97,7 +97,7 @@ export default function VerifyPage() {
               value={tokenId}
               onChange={(e) => setTokenId(e.target.value)}
               placeholder="Masukkan Token ID (contoh: 1, 2, 3...)"
-              className="w-full h-14 pl-13 pr-32 bg-transparent text-foreground placeholder:text-muted-foreground/60 focus:outline-none text-base font-mono"
+              className="w-full h-14 pl-[52px] pr-32 bg-transparent text-foreground placeholder:text-muted-foreground/60 focus:outline-none text-base font-mono"
               id="verify-token-input"
             />
             <Button
