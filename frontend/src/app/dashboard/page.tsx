@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
+import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, usePublicClient } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { EDUTRUST_ABI, EDUTRUST_ADDRESS } from '@/config/contracts';
 import { supabase } from '@/lib/supabase';
@@ -12,6 +12,7 @@ import {
   History, Trash2, Upload, FileText, X, ImageIcon
 } from 'lucide-react';
 import { RegistrationForm } from '@/components/dashboard/RegistrationForm';
+import { parseAbiItem, decodeEventLog } from 'viem';
 
 interface CertificateRow {
   id: string;
@@ -122,8 +123,14 @@ function FileDropZone({
   );
 }
 
+// ABI item for parsing CertificateIssued event from tx receipt
+const CERT_ISSUED_ABI = parseAbiItem(
+  'event CertificateIssued(uint256 indexed tokenId, address indexed recipient, address indexed institution, string metadataURI, uint256 timestamp)'
+);
+
 export default function DashboardPage() {
   const { address, isConnected } = useAccount();
+  const publicClient = usePublicClient();
   const [tab, setTab] = useState<'issue' | 'history'>('issue');
   const [recipients, setRecipients] = useState<RecipientInput[]>([
     { name: '', wallet: '', title: '', description: '', file: null, filePreview: null },
@@ -132,6 +139,8 @@ export default function DashboardPage() {
   const [loadingCerts, setLoadingCerts] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string>('');
   const [mintError, setMintError] = useState<string | null>(null);
+  // Track Supabase cert UUIDs inserted before mint (used to update after confirmation)
+  const pendingCertIds = useRef<{ id: string; wallet: string; metadataUrl: string }[]>([]);
 
   const { data: isApproved, isLoading: checkingApproval } = useReadContract({
     abi: EDUTRUST_ABI,
@@ -149,11 +158,51 @@ export default function DashboardPage() {
   }, [address, isApproved]);
 
   useEffect(() => {
-    if (isConfirmed) {
-      setUploadProgress('');
-      setRecipients([{ name: '', wallet: '', title: '', description: '', file: null, filePreview: null }]);
-    }
-  }, [isConfirmed]);
+    if (!isConfirmed || !txHash || !publicClient) return;
+
+    // After mint confirmed: fetch receipt, parse tokenIds from events, update Supabase
+    (async () => {
+      try {
+        const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
+
+        // Decode all CertificateIssued events from the receipt logs
+        const tokenMap = new Map<string, bigint>(); // recipient.toLowerCase() → tokenId
+        for (const log of receipt.logs) {
+          try {
+            const decoded = decodeEventLog({ abi: [CERT_ISSUED_ABI], ...log });
+            if (decoded.eventName === 'CertificateIssued') {
+              const { tokenId, recipient } = decoded.args as { tokenId: bigint; recipient: string };
+              tokenMap.set(recipient.toLowerCase(), tokenId);
+            }
+          } catch { /* skip non-matching logs */ }
+        }
+
+        // Update each pending Supabase row with tokenId + txHash + MINTED status
+        await Promise.allSettled(
+          pendingCertIds.current.map(({ id, wallet }) => {
+            const tokenId = tokenMap.get(wallet.toLowerCase());
+            if (tokenId === undefined) return Promise.resolve();
+            return fetch('/api/certificates', {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id,
+                token_id: Number(tokenId),
+                tx_hash: txHash,
+              }),
+            });
+          })
+        );
+      } catch (err) {
+        console.error('[dashboard] post-mint Supabase update error:', err);
+      } finally {
+        pendingCertIds.current = [];
+        setUploadProgress('');
+        setRecipients([{ name: '', wallet: '', title: '', description: '', file: null, filePreview: null }]);
+        if (address && isApproved) fetchCertificates();
+      }
+    })();
+  }, [isConfirmed, txHash]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fetchCertificates = async () => {
     if (!address) return;
@@ -205,6 +254,7 @@ export default function DashboardPage() {
     if (validRecipients.length === 0) return;
 
     setMintError(null);
+    pendingCertIds.current = [];
     const metadataUrls: string[] = [];
     const wallets: `0x${string}`[] = [];
 
@@ -219,11 +269,9 @@ export default function DashboardPage() {
         const ext = r.file.name.split('.').pop();
         const docPath = `documents/${address.toLowerCase()}/${ts}_${slug}.${ext}`;
         setUploadProgress(`[${idx + 1}/${validRecipients.length}] Mengupload file sertifikat...`);
-
         const { data: docData, error: docErr } = await supabase.storage
           .from('certificates')
           .upload(docPath, r.file, { upsert: false, contentType: r.file.type });
-
         if (!docErr && docData) {
           const { data: pubUrl } = supabase.storage.from('certificates').getPublicUrl(docData.path);
           documentUrl = pubUrl.publicUrl;
@@ -241,30 +289,51 @@ export default function DashboardPage() {
         ],
       };
       if (documentUrl) {
-        // Store document URL in metadata — image field for NFT marketplaces
         metadata.image = documentUrl;
         metadata.document_url = documentUrl;
       }
 
-      // 3. Upload metadata JSON
+      // 3. Upload metadata JSON to Supabase Storage
       setUploadProgress(`[${idx + 1}/${validRecipients.length}] Menyimpan metadata...`);
       const metaBlob = new Blob([JSON.stringify(metadata, null, 2)], { type: 'application/json' });
       const metaPath = `metadata/${address.toLowerCase()}/${ts}_${slug}.json`;
-
       const { data: metaData, error: metaErr } = await supabase.storage
         .from('certificates')
         .upload(metaPath, metaBlob, { upsert: false, contentType: 'application/json' });
 
+      let metadataUrl: string;
       if (metaErr || !metaData) {
-        // Fallback: base64 inline data URI
-        const url = `data:application/json;base64,${btoa(JSON.stringify(metadata))}`;
-        metadataUrls.push(url);
+        metadataUrl = `data:application/json;base64,${btoa(JSON.stringify(metadata))}`;
       } else {
         const { data: pubUrl } = supabase.storage.from('certificates').getPublicUrl(metaData.path);
-        metadataUrls.push(pubUrl.publicUrl);
+        metadataUrl = pubUrl.publicUrl;
       }
-
+      metadataUrls.push(metadataUrl);
       wallets.push(r.wallet as `0x${string}`);
+
+      // 4. INSERT certificate row to Supabase (PENDING_MINT)
+      setUploadProgress(`[${idx + 1}/${validRecipients.length}] Menyimpan ke database...`);
+      try {
+        const dbRes = await fetch('/api/certificates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            institution_wallet: address,
+            recipient_wallet:   r.wallet,
+            recipient_name:     r.name,
+            title:              r.title,
+            description:        r.description || null,
+            metadata_url:       metadataUrl,
+          }),
+        });
+        if (dbRes.ok) {
+          const { id } = await dbRes.json();
+          pendingCertIds.current.push({ id, wallet: r.wallet, metadataUrl });
+        }
+      } catch (err) {
+        console.warn('[dashboard] Supabase pre-insert failed:', err);
+        // non-fatal: continue to mint even if DB insert failed
+      }
     }
 
     setUploadProgress('Mengirim transaksi ke blockchain Monad...');

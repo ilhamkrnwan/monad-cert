@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
@@ -8,7 +8,7 @@ import { EDUTRUST_ABI, EDUTRUST_ADDRESS } from '@/config/contracts';
 import { Button } from '@/components/ui/button';
 import {
   ShieldAlert, Loader2, CheckCircle2, XCircle,
-  Building2, Ban, Clock, RefreshCw, Globe, Mail
+  Building2, Ban, Clock, RefreshCw, Globe, Mail, AlertCircle,
 } from 'lucide-react';
 
 interface Institution {
@@ -22,6 +22,11 @@ interface Institution {
   website?: string;
   created_at: string;
 }
+
+type PendingAction = {
+  wallet: string;
+  type: 'grant' | 'revoke';
+} | null;
 
 const fadeUp = {
   hidden: { opacity: 0, y: 16 },
@@ -39,8 +44,14 @@ export default function AdminPage() {
   const [institutions, setInstitutions] = useState<Institution[]>([]);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [actionTarget, setActionTarget] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [filter, setFilter] = useState<'ALL' | 'PENDING' | 'APPROVED' | 'REJECTED'>('ALL');
+
+  // Track which action we are confirming so the useEffect knows what Supabase update to do
+  const pendingActionRef = useRef<PendingAction>(null);
+
+  // ── Contract reads ─────────────────────────────────────────────────────────
 
   const { data: contractOwner, isLoading: checkingOwner } = useReadContract({
     abi: EDUTRUST_ABI,
@@ -48,15 +59,18 @@ export default function AdminPage() {
     functionName: 'owner',
   });
 
-  const { writeContract, data: txHash, isPending } = useWriteContract();
-  const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({ hash: txHash });
-
   const isAdmin =
     address &&
     contractOwner &&
     address.toLowerCase() === (contractOwner as string).toLowerCase();
 
-  // Fetch via server-side API (bypasses RLS, sees ALL institutions)
+  // ── Contract writes ────────────────────────────────────────────────────────
+
+  const { writeContract, data: txHash, isPending, reset: resetWrite } = useWriteContract();
+  const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({ hash: txHash });
+
+  // ── Fetch institutions ─────────────────────────────────────────────────────
+
   const fetchInstitutions = useCallback(async () => {
     if (!address) return;
     setLoading(true);
@@ -77,15 +91,54 @@ export default function AdminPage() {
     if (isAdmin) fetchInstitutions();
   }, [isAdmin, fetchInstitutions]);
 
+  // ── After tx confirmed: sync status to Supabase ────────────────────────────
+
   useEffect(() => {
-    if (isConfirmed) {
-      fetchInstitutions();
-      setActionTarget(null);
-    }
-  }, [isConfirmed, fetchInstitutions]);
+    if (!isConfirmed || !txHash) return;
+
+    const action = pendingActionRef.current;
+    if (!action) return;
+
+    const newStatus = action.type === 'grant' ? 'APPROVED' : 'REJECTED';
+    setSyncError(null);
+
+    // PATCH Supabase via admin API route
+    fetch('/api/admin/institutions', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-caller-wallet': address!,
+      },
+      body: JSON.stringify({
+        wallet_address: action.wallet,
+        status: newStatus,
+      }),
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error('Supabase sync failed');
+        // Refresh list to reflect new status
+        return fetchInstitutions();
+      })
+      .catch((err) => {
+        console.error('[admin] Supabase sync error:', err);
+        setSyncError(
+          `Transaksi berhasil namun gagal sinkronisasi database. Refresh halaman ini.`
+        );
+      })
+      .finally(() => {
+        setPendingAction(null);
+        pendingActionRef.current = null;
+        resetWrite();
+      });
+  }, [isConfirmed, txHash, address, fetchInstitutions, resetWrite]);
+
+  // ── Action handlers ────────────────────────────────────────────────────────
 
   const handleGrant = (walletAddress: string) => {
-    setActionTarget(walletAddress);
+    const action: PendingAction = { wallet: walletAddress, type: 'grant' };
+    setPendingAction(action);
+    pendingActionRef.current = action;
+    setSyncError(null);
     writeContract({
       abi: EDUTRUST_ABI,
       address: EDUTRUST_ADDRESS,
@@ -95,7 +148,10 @@ export default function AdminPage() {
   };
 
   const handleRevoke = (walletAddress: string) => {
-    setActionTarget(walletAddress);
+    const action: PendingAction = { wallet: walletAddress, type: 'revoke' };
+    setPendingAction(action);
+    pendingActionRef.current = action;
+    setSyncError(null);
     writeContract({
       abi: EDUTRUST_ABI,
       address: EDUTRUST_ADDRESS,
@@ -112,7 +168,7 @@ export default function AdminPage() {
     REJECTED: institutions.filter((i) => i.status === 'REJECTED').length,
   };
 
-  // ── Guards ──────────────────────────────────────────────────
+  // ── Guards ─────────────────────────────────────────────────────────────────
 
   if (!isConnected) {
     return (
@@ -154,7 +210,7 @@ export default function AdminPage() {
     );
   }
 
-  // ── Main UI ──────────────────────────────────────────────────
+  // ── Main UI ────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen pt-24 pb-16 px-5 sm:px-8 relative overflow-hidden">
@@ -177,7 +233,7 @@ export default function AdminPage() {
           </button>
         </motion.div>
 
-        {/* Stats bar */}
+        {/* Stats tabs */}
         <motion.div initial="hidden" animate="show" variants={fadeUp} className="grid grid-cols-4 gap-3 mb-6">
           {(['ALL', 'PENDING', 'APPROVED', 'REJECTED'] as const).map((s) => (
             <button
@@ -195,23 +251,61 @@ export default function AdminPage() {
           ))}
         </motion.div>
 
-        {/* Tx success banner */}
-        <AnimatePresence>
-          {isConfirmed && txHash && (
+        {/* Status banners */}
+        <AnimatePresence mode="wait">
+          {/* Tx in progress */}
+          {(isPending || isConfirming) && (
             <motion.div
+              key="pending"
+              initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+              className="mb-5 p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/50 flex items-center gap-3"
+            >
+              <Loader2 className="h-5 w-5 text-amber-600 animate-spin flex-shrink-0" />
+              <div>
+                <p className="text-sm font-semibold text-amber-800 dark:text-amber-200">
+                  {isPending ? 'Menunggu konfirmasi wallet...' : 'Mengkonfirmasi transaksi di Monad...'}
+                </p>
+                {pendingAction && (
+                  <p className="text-xs text-amber-600/80 font-mono mt-0.5 truncate">
+                    {pendingAction.type === 'grant' ? '⬆ grantInstitution' : '⬇ revokeInstitution'} → {pendingAction.wallet}
+                  </p>
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {/* Tx confirmed + Supabase synced */}
+          {isConfirmed && txHash && !isPending && !isConfirming && !syncError && (
+            <motion.div
+              key="success"
               initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
               className="mb-5 p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-800/50 flex items-center gap-3"
             >
               <CheckCircle2 className="h-5 w-5 text-emerald-600 flex-shrink-0" />
               <div>
-                <p className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">Transaksi On-chain Berhasil!</p>
+                <p className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
+                  Berhasil! Status institusi telah diperbarui di blockchain & database.
+                </p>
                 <p className="text-xs text-emerald-600/80 font-mono mt-0.5 break-all">{txHash}</p>
               </div>
             </motion.div>
           )}
+
+          {/* Supabase sync error */}
+          {syncError && (
+            <motion.div
+              key="sync-err"
+              initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+              className="mb-5 p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/50 flex items-center gap-3"
+            >
+              <AlertCircle className="h-5 w-5 text-amber-600 flex-shrink-0" />
+              <p className="text-sm text-amber-800 dark:text-amber-200">{syncError}</p>
+              <button onClick={fetchInstitutions} className="ml-auto text-xs underline text-amber-700">Refresh</button>
+            </motion.div>
+          )}
         </AnimatePresence>
 
-        {/* Error state */}
+        {/* Fetch error */}
         {fetchError && (
           <div className="mb-5 p-4 rounded-2xl border border-destructive/30 bg-destructive/5 text-sm text-destructive flex items-center gap-2">
             <XCircle className="h-4 w-4 flex-shrink-0" />
@@ -235,85 +329,97 @@ export default function AdminPage() {
             </p>
           </motion.div>
         ) : (
-          <motion.div initial="hidden" animate="show" variants={{ show: { transition: { staggerChildren: 0.06 } } }} className="space-y-4">
-            {filtered.map((inst) => (
-              <motion.div
-                key={inst.id}
-                variants={fadeUp}
-                className="p-6 rounded-2xl border border-border bg-white/60 dark:bg-[#1a1932]/40 backdrop-blur-sm hover:shadow-lg hover:shadow-[var(--primary)]/5 transition-all duration-200"
-              >
-                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
-                  <div className="flex-1 min-w-0">
-                    {/* Name & badges */}
-                    <div className="flex flex-wrap items-center gap-2 mb-2">
-                      <h3 className="text-base font-bold text-foreground">{inst.name}</h3>
-                      <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${STATUS_BADGE[inst.status]}`}>
-                        {inst.status === 'PENDING' && <Clock className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
-                        {inst.status === 'APPROVED' && <CheckCircle2 className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
-                        {inst.status === 'REJECTED' && <XCircle className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
-                        {inst.status}
-                      </span>
-                      <span className="px-2 py-0.5 rounded-full text-xs bg-[var(--secondary)] text-[var(--primary)] font-medium">
-                        {inst.type}
-                      </span>
+          <motion.div
+            initial="hidden" animate="show"
+            variants={{ show: { transition: { staggerChildren: 0.06 } } }}
+            className="space-y-4"
+          >
+            {filtered.map((inst) => {
+              const isActing =
+                (isPending || isConfirming) && pendingAction?.wallet === inst.wallet_address;
+
+              return (
+                <motion.div
+                  key={inst.id}
+                  variants={fadeUp}
+                  className="p-6 rounded-2xl border border-border bg-white/60 dark:bg-[#1a1932]/40 backdrop-blur-sm hover:shadow-lg hover:shadow-[var(--primary)]/5 transition-all duration-200"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      {/* Name & badges */}
+                      <div className="flex flex-wrap items-center gap-2 mb-2">
+                        <h3 className="text-base font-bold text-foreground">{inst.name}</h3>
+                        <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${STATUS_BADGE[inst.status]}`}>
+                          {inst.status === 'PENDING'   && <Clock        className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
+                          {inst.status === 'APPROVED'  && <CheckCircle2 className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
+                          {inst.status === 'REJECTED'  && <XCircle      className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
+                          {inst.status}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-full text-xs bg-[var(--secondary)] text-[var(--primary)] font-medium">
+                          {inst.type}
+                        </span>
+                      </div>
+
+                      {/* Wallet */}
+                      <p className="text-xs font-mono text-muted-foreground/70 mb-2 truncate">{inst.wallet_address}</p>
+
+                      {/* Contact */}
+                      <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+                        <span className="flex items-center gap-1">
+                          <Mail className="h-3 w-3" />{inst.contact_email}
+                        </span>
+                        {inst.website && (
+                          <a href={inst.website} target="_blank" rel="noopener noreferrer"
+                            className="flex items-center gap-1 hover:text-[var(--primary)] transition-colors">
+                            <Globe className="h-3 w-3" />{inst.website}
+                          </a>
+                        )}
+                      </div>
+
+                      {inst.description && (
+                        <p className="text-sm text-muted-foreground mt-2 line-clamp-2">{inst.description}</p>
+                      )}
+
+                      <p className="text-xs text-muted-foreground/50 mt-2">
+                        Mendaftar:{' '}
+                        {new Date(inst.created_at).toLocaleDateString('id-ID', {
+                          day: 'numeric', month: 'long', year: 'numeric',
+                        })}
+                      </p>
                     </div>
 
-                    {/* Wallet */}
-                    <p className="text-xs font-mono text-muted-foreground/70 mb-2 truncate">{inst.wallet_address}</p>
-
-                    {/* Contact */}
-                    <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-                      <span className="flex items-center gap-1">
-                        <Mail className="h-3 w-3" />{inst.contact_email}
-                      </span>
-                      {inst.website && (
-                        <a href={inst.website} target="_blank" rel="noopener noreferrer"
-                          className="flex items-center gap-1 hover:text-[var(--primary)] transition-colors">
-                          <Globe className="h-3 w-3" />{inst.website}
-                        </a>
-                      )}
+                    {/* Action buttons */}
+                    <div className="flex gap-2 flex-shrink-0">
+                      <Button
+                        size="sm"
+                        onClick={() => handleGrant(inst.wallet_address)}
+                        disabled={isActing || inst.status === 'APPROVED'}
+                        className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs disabled:opacity-50"
+                      >
+                        {isActing && pendingAction?.type === 'grant' ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <><CheckCircle2 className="h-3.5 w-3.5 mr-1" />Approve</>
+                        )}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleRevoke(inst.wallet_address)}
+                        disabled={isActing || inst.status === 'REJECTED'}
+                        className="rounded-xl border-red-200 text-red-600 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20 text-xs disabled:opacity-50"
+                      >
+                        {isActing && pendingAction?.type === 'revoke' ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <><XCircle className="h-3.5 w-3.5 mr-1" />Revoke</>
+                        )}
+                      </Button>
                     </div>
-
-                    {inst.description && (
-                      <p className="text-sm text-muted-foreground mt-2 line-clamp-2">{inst.description}</p>
-                    )}
-
-                    <p className="text-xs text-muted-foreground/50 mt-2">
-                      Mendaftar: {new Date(inst.created_at).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}
-                    </p>
                   </div>
-
-                  {/* Action buttons */}
-                  <div className="flex gap-2 flex-shrink-0">
-                    <Button
-                      size="sm"
-                      onClick={() => handleGrant(inst.wallet_address)}
-                      disabled={isPending || isConfirming || inst.status === 'APPROVED'}
-                      className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs disabled:opacity-50"
-                    >
-                      {isPending && actionTarget === inst.wallet_address ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <><CheckCircle2 className="h-3.5 w-3.5 mr-1" />Approve</>
-                      )}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleRevoke(inst.wallet_address)}
-                      disabled={isPending || isConfirming || inst.status === 'REJECTED'}
-                      className="rounded-xl border-red-200 text-red-600 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20 text-xs disabled:opacity-50"
-                    >
-                      {isPending && actionTarget === inst.wallet_address ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <><XCircle className="h-3.5 w-3.5 mr-1" />Revoke</>
-                      )}
-                    </Button>
-                  </div>
-                </div>
-              </motion.div>
-            ))}
+                </motion.div>
+              );
+            })}
           </motion.div>
         )}
       </div>
